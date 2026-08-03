@@ -169,25 +169,39 @@ final class BaseTrioAlertManager: TrioAlertManager, Injectable {
             "TrioAlertManager.issueAlert \(alert.identifier.value) level=\(alert.interruptionLevel)"
         )
 
-        // Pump alerts: look up in catalog → override interruptionLevel.
-        // Everything else (CGM lifecycle, Trio-internal glucose / loop) is
-        // passed through with the level its producer chose.
-        let effective: Alert = AlertCatalogRegistry.lookup(alert.identifier).map { entry in
-            applyCatalogEntry(entry, to: alert)
-        } ?? alert
+        let now = Date()
 
-        // Per-tier snooze for catalog-known pump alerts. Critical tier
-        // ignores snooze.
-        if let tier = DeviceAlertSeverity(level: effective.interruptionLevel),
-           AlertCatalogRegistry.lookup(effective.identifier) != nil,
-           tier != .critical,
-           DeviceAlertsStore.shared.isTierSnoozed(tier, at: Date())
-        {
-            debug(.service, "TrioAlertManager dropped \(effective.identifier.value): tier \(tier) snoozed")
-            return
+        // Catalog-known alerts (pump, CGM lifecycle, Trio algorithm) get the
+        // user's Device Alarms tier config applied — tone, Play Sound,
+        // Override Silence & Focus, day/night window. Everything else
+        // (Trio-internal glucose, owned by `GlucoseAlertCoordinator`) is
+        // passed through with the level and sound its producer chose.
+        let effective: Alert
+        if let entry = AlertCatalogRegistry.lookup(alert.identifier) {
+            // Tier comes from the catalog, never from the post-override
+            // level: a Time-Sensitive alarm with "Override Silence & Focus"
+            // on still snoozes and configures as Time-Sensitive.
+            guard let tier = DeviceAlertSeverity(level: entry.interruptionLevel) else { return }
+
+            // Per-tier snooze. Critical tier ignores snooze.
+            if tier != .critical, DeviceAlertsStore.shared.isTierSnoozed(tier, at: now) {
+                debug(.service, "TrioAlertManager dropped \(alert.identifier.value): tier \(tier) snoozed")
+                return
+            }
+            // nil = every variant in the tier disabled, user opted out.
+            let isNight = GlucoseAlertsStore.shared.configuration.isNight(at: now)
+            guard let config = DeviceAlertsStore.shared.config(for: tier, at: now, isNight: isNight) else {
+                debug(
+                    .service,
+                    "TrioAlertManager dropped \(alert.identifier.value): all variants in tier \(tier) disabled"
+                )
+                return
+            }
+            effective = Self.applyDeviceSeverityConfig(config, entry: entry, to: alert)
+        } else {
+            effective = alert
         }
 
-        let now = Date()
         // Critical alerts pierce the snooze/mute window. Everything else is
         // suppressed entirely while muted (no modal, no UN sound, no critical
         // audio fallback).
@@ -213,14 +227,26 @@ final class BaseTrioAlertManager: TrioAlertManager, Injectable {
         playCriticalAudioFallbackIfNeeded(effective, muted: muted)
     }
 
-    private func applyCatalogEntry(_ entry: Alert.CatalogEntry, to alert: Alert) -> Alert {
+    /// Overlays the user's Device Alarms tier config onto a catalog-known
+    /// alert. Plugins issue their alerts without a sound, so this is what
+    /// gives a pump/CGM alarm the tone the user picked — and what engages
+    /// `CriticalAlertAudioPlayer`, which needs a filename to play.
+    /// Static so tests can exercise it without the Swinject graph.
+    static func applyDeviceSeverityConfig(
+        _ config: DeviceAlertSeverityConfig,
+        entry: Alert.CatalogEntry,
+        to alert: Alert
+    ) -> Alert {
         Alert(
             identifier: alert.identifier,
             foregroundContent: alert.foregroundContent,
             backgroundContent: alert.backgroundContent,
             trigger: alert.trigger,
-            interruptionLevel: entry.interruptionLevel,
-            sound: alert.sound,
+            // Escalate only — the catalog level is the floor, so the override
+            // toggle can't demote a Critical alarm or promote a Normal one
+            // past what the catalog says it is.
+            interruptionLevel: config.overridesSilenceAndDND ? .critical : entry.interruptionLevel,
+            sound: config.playsSound ? .sound(name: config.soundFilename) : nil,
             metadata: alert.metadata
         )
     }
