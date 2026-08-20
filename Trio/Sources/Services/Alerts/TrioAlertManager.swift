@@ -56,6 +56,9 @@ final class BaseTrioAlertManager: TrioAlertManager, Injectable {
     /// is `@MainActor` (its `MPVolumeView` + `Timer` members require main),
     /// but `BaseTrioAlertManager.init` runs on the Swinject resolve thread.
     @MainActor private var criticalAudioPlayer: CriticalAlertAudioPlayer?
+    /// Preferred audible channel on iOS 26+. Falls back to `criticalAudioPlayer`
+    /// when AlarmKit is unavailable or the user hasn't authorized it.
+    @MainActor private var alarmScheduler: CriticalAlertAlarmScheduler?
 
     let modalScheduler: TrioModalAlertScheduler
     private let userNotificationScheduler: TrioUserNotificationAlertScheduler
@@ -87,6 +90,15 @@ final class BaseTrioAlertManager: TrioAlertManager, Injectable {
             .object(forKey: "UserNotificationsManager.snoozeUntilDate") as? Date
         if let until = persistedSnoozeUntil, until > Date() {
             muter.mute(for: until.timeIntervalSinceNow)
+        }
+
+        // AlarmKit's Stop button runs an AppIntent in a fresh process slice
+        // with no reference to this manager, so it routes through the shared
+        // bridge. Register here; taps queued before this point are flushed.
+        Task { @MainActor [weak self] in
+            CriticalAlertAcknowledgementBridge.shared.setHandler { identifier in
+                self?.handleAcknowledgement(identifier: identifier)
+            }
         }
 
         // iOS doesn't fire `didReceive` on swipe for critical UNs, so we
@@ -154,9 +166,20 @@ final class BaseTrioAlertManager: TrioAlertManager, Injectable {
         // user explicitly opted out of audio on this alarm.
         guard let soundName = alert.sound?.filename else { return }
         Task { @MainActor in
-            if criticalAudioPlayer == nil { criticalAudioPlayer = CriticalAlertAudioPlayer() }
-            criticalAudioPlayer?.play(soundNamed: soundName)
+            // AlarmKit pierces silent/Focus and survives app suspension.
+            if alarmScheduler == nil { alarmScheduler = CriticalAlertAlarmScheduler() }
+            let scheduled = alarmScheduler?.scheduleAlarm(for: alert) { [weak self] in
+                Task { @MainActor in self?.playAudioFallback(soundNamed: soundName) }
+            } ?? false
+            guard !scheduled else { return }
+            // Fallback: in-process audio. Only sounds while Trio is running.
+            playAudioFallback(soundNamed: soundName)
         }
+    }
+
+    @MainActor private func playAudioFallback(soundNamed soundName: String) {
+        if criticalAudioPlayer == nil { criticalAudioPlayer = CriticalAlertAudioPlayer() }
+        criticalAudioPlayer?.play(soundNamed: soundName)
     }
 
     // MARK: - Issue / Retract
@@ -260,7 +283,10 @@ final class BaseTrioAlertManager: TrioAlertManager, Injectable {
         modalScheduler.unschedule(identifier: identifier)
         userNotificationScheduler.unschedule(identifier: identifier)
         throttler.reset(identifier: identifier)
-        Task { @MainActor in criticalAudioPlayer?.stop() }
+        Task { @MainActor in
+            criticalAudioPlayer?.stop()
+            alarmScheduler?.cancelAlarm(for: identifier)
+        }
         alertHistoryStorage.removeAlert(identifier: identifier.alertIdentifier)
     }
 
@@ -298,7 +324,10 @@ final class BaseTrioAlertManager: TrioAlertManager, Injectable {
     func handleAcknowledgement(identifier: Alert.Identifier) {
         modalScheduler.unschedule(identifier: identifier)
         userNotificationScheduler.unschedule(identifier: identifier)
-        Task { @MainActor in criticalAudioPlayer?.stop() }
+        Task { @MainActor in
+            criticalAudioPlayer?.stop()
+            alarmScheduler?.cancelAlarm(for: identifier)
+        }
         // All matching entries — replay + a genuine re-issue can coexist.
         alertHistoryStorage.acknowledgeAllEntries(
             managerIdentifier: identifier.managerIdentifier,
