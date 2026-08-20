@@ -430,3 +430,32 @@ import Testing
         #expect(effective.trigger == issued.trigger)
     }
 }
+
+/// Guards the #1371 regression: alarm tones must be resolvable the way iOS
+/// resolves `UNNotificationSoundName` — from the flat top level of the main
+/// bundle (or `Library/Sounds`). Shipping them inside a `Sounds/` bundle
+/// subdirectory made every notification fall back to the default iOS sound.
+@Suite("Trio Alerts: alarm tone bundling") struct AlarmToneBundlingTests {
+    @Test("Every catalog tone resolves from the main bundle root") func tonesResolveAtBundleRoot() {
+        for filename in AlarmSoundCatalog.allFilenames {
+            let resource = (filename as NSString).deletingPathExtension
+            let ext = (filename as NSString).pathExtension
+            #expect(
+                Bundle.main.url(forResource: resource, withExtension: ext) != nil,
+                "\(filename) is not at the main bundle root — UNNotificationSound cannot resolve it"
+            )
+        }
+    }
+
+    @Test("critical.caf fallback tone is bundled") func criticalFallbackBundled() {
+        #expect(Bundle.main.url(forResource: "critical", withExtension: "caf") != nil)
+    }
+
+    @Test("Vendor sounds are namespaced flat, not nested") func vendorSoundsNamespaced() {
+        // iOS only looks at the top level of Library/Sounds, so a per-manager
+        // subdirectory would never resolve.
+        let name = AlertSoundLoader.namespaced("Omnipod", "beep.caf")
+        #expect(name == "Omnipod-beep.caf")
+        #expect(!name.contains("/"))
+    }
+}

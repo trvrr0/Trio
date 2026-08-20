@@ -75,8 +75,7 @@ final class BaseTrioAlertManager: TrioAlertManager, Injectable {
         soundLoader = AlertSoundLoader(destination: soundsRoot)
         modalScheduler = TrioModalAlertScheduler()
         userNotificationScheduler = TrioUserNotificationAlertScheduler(
-            notificationCenter: UNUserNotificationCenter.current(),
-            soundsRoot: soundsRoot
+            notificationCenter: UNUserNotificationCenter.current()
         )
         injectServices(resolver)
         modalScheduler.responder = self
@@ -583,12 +582,10 @@ final class AlertSoundLoader {
 
     func copySounds(from vendor: AlertSoundVendor, managerIdentifier: String) {
         guard let sourceBase = vendor.getSoundBaseURL() else { return }
-        let target = destination.appendingPathComponent(managerIdentifier, isDirectory: true)
-        try? fileManager.createDirectory(at: target, withIntermediateDirectories: true)
         for sound in vendor.getSounds() {
             guard let filename = sound.filename else { continue }
             let source = sourceBase.appendingPathComponent(filename)
-            let dest = target.appendingPathComponent(filename)
+            let dest = destination.appendingPathComponent(Self.namespaced(managerIdentifier, filename))
             guard fileManager.fileExists(atPath: source.path) else { continue }
             if fileManager.fileExists(atPath: dest.path) { continue }
             try? fileManager.copyItem(at: source, to: dest)
@@ -598,8 +595,13 @@ final class AlertSoundLoader {
     func url(for alert: Alert) -> URL? {
         guard let filename = alert.sound?.filename else { return nil }
         let url = destination
-            .appendingPathComponent(alert.identifier.managerIdentifier, isDirectory: true)
-            .appendingPathComponent(filename)
+            .appendingPathComponent(Self.namespaced(alert.identifier.managerIdentifier, filename))
         return fileManager.fileExists(atPath: url.path) ? url : nil
+    }
+
+    /// iOS only resolves `UNNotificationSoundName` against the flat top level of
+    /// `Library/Sounds`, so vendor sounds are namespaced instead of nested.
+    static func namespaced(_ managerIdentifier: String, _ filename: String) -> String {
+        "\(managerIdentifier)-\(filename)"
     }
 }
