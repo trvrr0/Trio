@@ -150,7 +150,6 @@ final class BaseTrioAlertManager: TrioAlertManager, Injectable {
     /// through UNNotification at fire time. No-op when muted or non-critical.
     private func playCriticalAudioFallbackIfNeeded(_ alert: Alert, muted: Bool) {
         guard alert.interruptionLevel == .critical, !muted else { return }
-        guard case .immediate = alert.trigger else { return }
         // Honor `playsSound: false` (alert was issued with sound: nil) —
         // user explicitly opted out of audio on this alarm.
         guard let soundName = alert.sound?.filename else { return }
@@ -223,7 +222,11 @@ final class BaseTrioAlertManager: TrioAlertManager, Injectable {
             muted: muted,
             soundURL: soundLoader.url(for: effective)
         )
-        playCriticalAudioFallbackIfNeeded(effective, muted: muted)
+        // `.delayed`/`.repeating` alerts start their audio when the timer
+        // fires (`alertDidFire`), not now — this is only their arm time.
+        if case .immediate = effective.trigger {
+            playCriticalAudioFallbackIfNeeded(effective, muted: muted)
+        }
     }
 
     /// Overlays the user's Device Alarms tier config onto a catalog-known
@@ -488,6 +491,10 @@ extension BaseTrioAlertManager: TrioModalAlertResponder, TrioUserNotificationAle
         Task { @MainActor [weak self] in
             await self?.applySnooze(for: duration)
         }
+    }
+
+    func alertDidFire(_ alert: Alert) {
+        playCriticalAudioFallbackIfNeeded(alert, muted: muter.shouldMute(at: Date()))
     }
 
     func isAlertActive(identifier: Alert.Identifier) -> Bool {
